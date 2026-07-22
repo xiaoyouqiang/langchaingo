@@ -702,7 +702,7 @@ func combineStreamingChatResponse(
 		if len(choice.Delta.ToolCalls) > 0 {
 			_, response.Choices[0].Message.ToolCalls = updateToolCalls(response.Choices[0].Message.ToolCalls,
 				choice.Delta.ToolCalls)
-			for _, item := range response.Choices[0].Message.ToolCalls {
+			for _, item := range choice.Delta.ToolCalls {
 				toolCalls = append(toolCalls, llms.ToolCall{
 					ID:   item.ID,
 					Type: string(item.Type),
@@ -712,11 +712,6 @@ func combineStreamingChatResponse(
 					},
 				})
 			}
-		}
-
-		if len(choice.Delta.ToolCalls) > 0 {
-			_, response.Choices[0].Message.ToolCalls = updateToolCalls(response.Choices[0].Message.ToolCalls,
-				choice.Delta.ToolCalls)
 		}
 
 		if payload.StreamingFunc != nil {
