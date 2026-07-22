@@ -29,6 +29,7 @@ service-account.json
 .vscode/
 *.swp
 *.swo
+*.txt
 
 embeddings/cybertron/models/*
 examples/cybertron-embedding-example/models/*

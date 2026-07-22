@@ -354,6 +354,9 @@ func (o *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 		return retryErr
 	})
 	if err != nil {
+		if o.CallbacksHandler != nil {
+			o.CallbacksHandler.HandleLLMError(ctx, err)
+		}
 		return nil, err
 	}
 	if len(result.Choices) == 0 {

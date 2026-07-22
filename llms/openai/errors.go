@@ -71,7 +71,7 @@ func MapError(err error) error {
 	for _, mapping := range openaiErrorMappings {
 		for _, pattern := range mapping.patterns {
 			if strings.Contains(errStr, pattern) {
-				classified := llms.NewError(mapping.code, "openai", mapping.message).WithCause(err)
+				classified := llms.NewError(mapping.code, "openai", mapping.message+": "+err.Error()).WithCause(err)
 				// Transfer Retry-After from HTTP response error.
 				transferRetryAfter(err, classified)
 				return classified
