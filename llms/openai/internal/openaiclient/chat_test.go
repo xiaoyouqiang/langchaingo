@@ -125,25 +125,23 @@ func TestChatMessage_MarshalUnmarshal_WithReasoning(t *testing.T) {
 
 // TestUpdateToolCalls_Sequential verifies updateToolCalls when the model streams
 // parallel tool calls in order (tool 0 fully, then tool 1 fully). This is the
-// common case for OpenAI and the current implementation handles it correctly.
+// common case for spec-compliant OpenAI streams.
 func TestUpdateToolCalls_Sequential(t *testing.T) {
 	t.Parallel()
 
 	var tools []ToolCall
-	// Simulate SSE deltas. In real OpenAI streams each delta carries an `index`
-	// field identifying which tool call it belongs to; the ToolCall struct here
-	// does not parse that field, so we annotate the intended index in comments.
+	// Spec-compliant OpenAI streams populate `index` on every tool_call delta.
 	deltas := [][]*ToolCall{
 		// index=0: new tool A (get_weather)
-		{{ID: "call_A", Type: ToolTypeFunction, Function: ToolFunction{Name: "get_weather"}}},
+		{{Index: 0, ID: "call_A", Type: ToolTypeFunction, Function: ToolFunction{Name: "get_weather"}}},
 		// index=0: args chunk 1
-		{{Type: "", Function: ToolFunction{Arguments: `{"loc`}}},
+		{{Index: 0, Type: "", Function: ToolFunction{Arguments: `{"loc`}}},
 		// index=0: args chunk 2
-		{{Type: "", Function: ToolFunction{Arguments: `ation":"Paris"}`}}},
+		{{Index: 0, Type: "", Function: ToolFunction{Arguments: `ation":"Paris"}`}}},
 		// index=1: new tool B (get_time)
-		{{ID: "call_B", Type: ToolTypeFunction, Function: ToolFunction{Name: "get_time"}}},
+		{{Index: 1, ID: "call_B", Type: ToolTypeFunction, Function: ToolFunction{Name: "get_time"}}},
 		// index=1: args chunk 1
-		{{Type: "", Function: ToolFunction{Arguments: `{"tz`}}},
+		{{Index: 1, Type: "", Function: ToolFunction{Arguments: `{"tz`}}},
 	}
 
 	for _, d := range deltas {
@@ -160,26 +158,54 @@ func TestUpdateToolCalls_Sequential(t *testing.T) {
 }
 
 // TestUpdateToolCalls_Interleaved verifies updateToolCalls when the model
-// interleaves argument deltas across multiple parallel tool calls. The OpenAI
-// streaming protocol permits this (each delta carries an `index` field), but
-// the current implementation ignores the index and always appends argument
-// chunks to the LAST tool in the slice. As a result tool[0]'s arguments are
-// incorrectly appended to tool[1].
-//
-// This test documents the bug and is expected to FAIL against the current
-// implementation.
+// interleaves argument deltas across multiple parallel tool calls. Each delta
+// carries its tool call's index; updateToolCalls must route arguments by index
+// rather than blindly appending to the last tool.
 func TestUpdateToolCalls_Interleaved(t *testing.T) {
 	t.Parallel()
 
 	var tools []ToolCall
 	deltas := [][]*ToolCall{
 		// index=0: new tool A
-		{{ID: "call_A", Type: ToolTypeFunction, Function: ToolFunction{Name: "get_weather"}}},
+		{{Index: 0, ID: "call_A", Type: ToolTypeFunction, Function: ToolFunction{Name: "get_weather"}}},
 		// index=1: new tool B
-		{{ID: "call_B", Type: ToolTypeFunction, Function: ToolFunction{Name: "get_time"}}},
+		{{Index: 1, ID: "call_B", Type: ToolTypeFunction, Function: ToolFunction{Name: "get_time"}}},
 		// index=0: args for A
-		{{Type: "", Function: ToolFunction{Arguments: `{"loc`}}},
+		{{Index: 0, Type: "", Function: ToolFunction{Arguments: `{"loc`}}},
 		// index=1: args for B
+		{{Index: 1, Type: "", Function: ToolFunction{Arguments: `{"tz`}}},
+	}
+
+	for _, d := range deltas {
+		_, tools = updateToolCalls(tools, d)
+	}
+
+	require.Len(t, tools, 2, "should have two tool calls")
+
+	assert.Equal(t, "call_A", tools[0].ID)
+	assert.Equal(t, "get_weather", tools[0].Function.Name)
+	assert.Equal(t, `{"loc`, tools[0].Function.Arguments, "tool A should receive its own args")
+
+	assert.Equal(t, "call_B", tools[1].ID)
+	assert.Equal(t, "get_time", tools[1].Function.Name)
+	assert.Equal(t, `{"tz`, tools[1].Function.Arguments, "tool B should receive its own args")
+}
+
+// TestUpdateToolCalls_NoIndexFallback covers providers that do NOT send the
+// `index` field in streaming tool_call deltas (non-compliant with the OpenAI
+// spec). In that case every delta's Index is 0, and updateToolCalls must fall
+// back to appending args to the last-created tool. This preserves the legacy
+// behavior so sequential multi-tool calls keep working on such providers.
+func TestUpdateToolCalls_NoIndexFallback(t *testing.T) {
+	t.Parallel()
+
+	var tools []ToolCall
+	// No Index set on any delta (simulates a non-compliant provider).
+	deltas := [][]*ToolCall{
+		{{ID: "call_A", Type: ToolTypeFunction, Function: ToolFunction{Name: "get_weather"}}},
+		{{Type: "", Function: ToolFunction{Arguments: `{"loc`}}},
+		{{Type: "", Function: ToolFunction{Arguments: `ation":"Paris"}`}}},
+		{{ID: "call_B", Type: ToolTypeFunction, Function: ToolFunction{Name: "get_time"}}},
 		{{Type: "", Function: ToolFunction{Arguments: `{"tz`}}},
 	}
 
@@ -189,12 +215,33 @@ func TestUpdateToolCalls_Interleaved(t *testing.T) {
 
 	require.Len(t, tools, 2, "should have two tool calls")
 
-	// Expected (correct) behavior: arguments land on the tool they belong to.
+	// Without index info, args must land on the most recently created tool.
 	assert.Equal(t, "call_A", tools[0].ID)
 	assert.Equal(t, "get_weather", tools[0].Function.Name)
-	assert.Equal(t, `{"loc`, tools[0].Function.Arguments, "tool A should receive its own args")
+	assert.Equal(t, `{"location":"Paris"}`, tools[0].Function.Arguments)
 
 	assert.Equal(t, "call_B", tools[1].ID)
 	assert.Equal(t, "get_time", tools[1].Function.Name)
-	assert.Equal(t, `{"tz`, tools[1].Function.Arguments, "tool B should receive its own args")
+	assert.Equal(t, `{"tz`, tools[1].Function.Arguments)
+}
+
+// TestUpdateToolCalls_SingleTool_NoIndex verifies that single-tool-call streams
+// work regardless of whether the provider sends index. Since there's only one
+// tool, "route by index 0" and "route to last" are equivalent.
+func TestUpdateToolCalls_SingleTool_NoIndex(t *testing.T) {
+	t.Parallel()
+
+	var tools []ToolCall
+	deltas := [][]*ToolCall{
+		{{ID: "call_A", Type: ToolTypeFunction, Function: ToolFunction{Name: "get_weather"}}},
+		{{Type: "", Function: ToolFunction{Arguments: `{"loc`}}},
+		{{Type: "", Function: ToolFunction{Arguments: `ation":"Paris"}`}}},
+	}
+
+	for _, d := range deltas {
+		_, tools = updateToolCalls(tools, d)
+	}
+
+	require.Len(t, tools, 1)
+	assert.Equal(t, `{"location":"Paris"}`, tools[0].Function.Arguments)
 }

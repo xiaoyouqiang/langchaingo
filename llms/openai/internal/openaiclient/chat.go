@@ -225,6 +225,10 @@ type ToolFunction struct {
 
 // ToolCall is a call to a tool.
 type ToolCall struct {
+	// Index is only used in streaming responses: it identifies which tool call
+	// a delta belongs to when the model emits multiple parallel tool calls.
+	// Non-streaming responses leave this as zero.
+	Index    int          `json:"index,omitempty"`
 	ID       string       `json:"id,omitempty"`
 	Type     ToolType     `json:"type"`
 	Function ToolFunction `json:"function,omitempty"`
@@ -756,19 +760,38 @@ func updateToolCalls(tools []ToolCall, delta []*ToolCall) ([]byte, []ToolCall) {
 	if len(delta) == 0 {
 		return []byte{}, tools
 	}
-	for _, t := range delta {
-		// if we have arguments append to the last Tool call
-		if t.Type == `` && t.Function.Arguments != `` {
-			lindex := len(tools) - 1
-			if lindex < 0 {
-				continue
-			}
+	// Detect whether the provider actually populates the `index` field. Spec-
+	// compliant OpenAI streams always send index (0,1,2,...) on every tool_call
+	// delta; some non-compliant providers omit it, leaving Index as 0 for every
+	// delta. We treat index as trustworthy only after observing Index > 0 on at
+	// least one tool call. This avoids regressing the legacy "append to last"
+	// behavior for providers that don't send index.
+	providerSendsIndex := false
+	for _, tc := range tools {
+		if tc.Index > 0 {
+			providerSendsIndex = true
+			break
+		}
+	}
 
-			tools[lindex].Function.Arguments += t.Function.Arguments
+	for _, t := range delta {
+		// Args-only delta: Type is empty and Arguments is non-empty.
+		if t.Type == `` && t.Function.Arguments != `` {
+			idx := len(tools) - 1
+			if providerSendsIndex && t.Index >= 0 && t.Index < len(tools) {
+				idx = t.Index
+			}
+			if idx >= 0 {
+				tools[idx].Function.Arguments += t.Function.Arguments
+			}
 			continue
 		}
 
-		// Otherwise, this is a new tool call, append that to the stack
+		// Otherwise, this is a new tool call. Remember if this delta proves the
+		// provider sends index, then append it to the stack.
+		if t.Index > 0 {
+			providerSendsIndex = true
+		}
 		tools = append(tools, *t)
 	}
 
