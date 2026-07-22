@@ -281,16 +281,18 @@ func (o *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 	}
 
 	req := &openaiclient.ChatRequest{
-		Model:                  opts.Model,
-		StopWords:              opts.StopWords,
-		Messages:               chatMsgs,
-		StreamingFunc:          opts.StreamingFunc,
-		StreamingReasoningFunc: opts.StreamingReasoningFunc,
-		Temperature:            opts.Temperature,
-		N:                      opts.N,
-		FrequencyPenalty:       opts.FrequencyPenalty,
-		PresencePenalty:        opts.PresencePenalty,
-		ReasoningEffort:        reasoningEffort,
+		Model:                             opts.Model,
+		StopWords:                         opts.StopWords,
+		Messages:                          chatMsgs,
+		StreamingFunc:                     opts.StreamingFunc,
+		StreamingReasoningFunc:            opts.StreamingReasoningFunc,
+		StreamingReasoningFuncAndToolCall: opts.StreamingReasoningFuncAndToolCall,
+		StreamingFuncAndToolCall:          opts.StreamingFuncAndToolCall,
+		Temperature:                       opts.Temperature,
+		N:                                 opts.N,
+		FrequencyPenalty:                  opts.FrequencyPenalty,
+		PresencePenalty:                   opts.PresencePenalty,
+		ReasoningEffort:                   reasoningEffort,
 
 		// Token handling: check metadata flag for legacy behavior
 		// By default use max_completion_tokens (modern field)
