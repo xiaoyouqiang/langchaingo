@@ -12,6 +12,38 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestChatRequestJSONMarshalWithOllamaThink(t *testing.T) {
+	t.Parallel()
+
+	marshalToMap := func(req ChatRequest) map[string]any {
+		data, err := json.Marshal(req)
+		require.NoError(t, err)
+		var result map[string]any
+		require.NoError(t, json.Unmarshal(data, &result))
+		return result
+	}
+
+	// think:false must be serialized explicitly — this is what disables
+	// thinking on Ollama models that think by default (e.g. qwen3).
+	thinkOff := false
+	result := marshalToMap(ChatRequest{Model: "qwen3:8b", OllamaThink: &thinkOff})
+	think, exists := result["think"]
+	assert.True(t, exists, `"think":false should be serialized`)
+	assert.Equal(t, false, think)
+
+	// think:true must be serialized as well.
+	thinkOn := true
+	result = marshalToMap(ChatRequest{Model: "qwen3:8b", OllamaThink: &thinkOn})
+	think, exists = result["think"]
+	assert.True(t, exists, `"think":true should be serialized`)
+	assert.Equal(t, true, think)
+
+	// Unset think must be omitted so non-Ollama endpoints see no extra field.
+	result = marshalToMap(ChatRequest{Model: "gpt-4o"})
+	_, exists = result["think"]
+	assert.False(t, exists, "think field should be omitted when unset")
+}
+
 func TestParseStreamingChatResponse_FinishReason(t *testing.T) {
 	ctx := context.Background()
 	t.Parallel()

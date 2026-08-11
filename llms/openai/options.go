@@ -38,8 +38,13 @@ func WithLegacyMaxTokensField() llms.CallOption {
 	}
 }
 
-// WithEnableThinking enables Qwen's deep thinking mode via OpenAI-compatible API.
-// Must be used with streaming — Qwen requires enable_thinking=false for non-streaming calls.
+// WithEnableThinking enables the deep thinking mode via OpenAI-compatible API.
+// Must be used with streaming (Qwen requires enable_thinking=false for non-streaming calls).
+//
+// It also maps to Ollama's top-level "think" parameter for Ollama servers
+// reached through their OpenAI-compatible endpoint (/v1/chat/completions):
+// enabled=false is serialized as "think": false, which disables thinking on
+// models that think by default (e.g. qwen3); enabled=true forces it on.
 //
 // Usage:
 //
@@ -56,6 +61,7 @@ func WithEnableThinking(enabled bool) llms.CallOption {
 			opts.Metadata = make(map[string]interface{})
 		}
 		opts.Metadata["qwen:enable_thinking"] = enabled
+		opts.Metadata["ollama:think"] = enabled
 		if enabled {
 			opts.Metadata["deepseek:enable_thinking"] = map[string]any{"type": "enabled"}
 		} else {

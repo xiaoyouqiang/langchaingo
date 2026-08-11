@@ -301,6 +301,7 @@ func TestClient_GenerateChatWithThink(t *testing.T) {
 	client, err := NewClient(parsedURL, rr.Client())
 	require.NoError(t, err)
 
+	thinkEnabled := true
 	req := &ChatRequest{
 		Model: "gemma3:1b",
 		Messages: []*Message{
@@ -310,10 +311,10 @@ func TestClient_GenerateChatWithThink(t *testing.T) {
 			},
 		},
 		Stream: false,
+		Think:  &thinkEnabled, // 顶层 think 开关（ollama 忽略 options.think）
 		Options: Options{
 			Temperature: 0.0,
 			NumPredict:  100,
-			Think:       true, // Enable reasoning mode
 		},
 	}
 
@@ -333,16 +334,13 @@ func TestClient_GenerateChatWithThink(t *testing.T) {
 }
 
 func TestOptionsJSONMarshalWithThink(t *testing.T) {
-	// Test that the think parameter is properly marshaled to JSON
-	opts := Options{
-		Temperature: 0.5,
-		Think:       true,
-	}
+	// think 是 ChatRequest 的【顶层】字段（ollama 忽略 options.think），这里验证其序列化三态。
+	thinkOn := true
+	reqOn := ChatRequest{Model: "m", Think: &thinkOn}
 
-	data, err := json.Marshal(opts)
+	data, err := json.Marshal(reqOn)
 	require.NoError(t, err)
 
-	// Check that the JSON contains the think field
 	var result map[string]interface{}
 	err = json.Unmarshal(data, &result)
 	require.NoError(t, err)
@@ -352,8 +350,24 @@ func TestOptionsJSONMarshalWithThink(t *testing.T) {
 	assert.True(t, exists, "think field should exist in JSON")
 	assert.Equal(t, true, think, "think field should be true")
 
-	// Verify temperature field for completeness
-	temp, exists := result["temperature"]
-	assert.True(t, exists, "temperature field should exist in JSON")
-	assert.Equal(t, float64(0.5), temp, "temperature should be 0.5")
+	// 关键回归：think:false 必须显式出现在 JSON 里。Qwen3 等模型默认开启思考，
+	// 若 omitempty 把 false 丢掉，模型会一直输出 reasoning 直到 num_predict 截断、正文为空。
+	thinkOff := false
+	reqOff := ChatRequest{Model: "m", Think: &thinkOff}
+	dataOff, err := json.Marshal(reqOff)
+	require.NoError(t, err)
+	var resultOff map[string]interface{}
+	require.NoError(t, json.Unmarshal(dataOff, &resultOff))
+	thinkVal, exists := resultOff["think"]
+	assert.True(t, exists, "think:false must be explicitly present in JSON")
+	assert.Equal(t, false, thinkVal, "think field should be false")
+
+	// nil 指针则应省略 think 字段（用模型默认）。
+	reqNil := ChatRequest{Model: "m"}
+	dataNil, err := json.Marshal(reqNil)
+	require.NoError(t, err)
+	var resultNil map[string]interface{}
+	require.NoError(t, json.Unmarshal(dataNil, &resultNil))
+	_, exists = resultNil["think"]
+	assert.False(t, exists, "nil think should be omitted from JSON")
 }

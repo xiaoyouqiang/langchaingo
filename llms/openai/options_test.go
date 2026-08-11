@@ -28,6 +28,40 @@ func TestWithMaxCompletionTokens(t *testing.T) {
 	}
 }
 
+func TestWithEnableThinking(t *testing.T) {
+	t.Parallel()
+
+	// Enabled: qwen/ollama flags true, deepseek type enabled
+	opts := &llms.CallOptions{}
+	WithEnableThinking(true)(opts)
+	if opts.Metadata == nil {
+		t.Fatal("expected Metadata to be initialized")
+	}
+	if v, ok := opts.Metadata["qwen:enable_thinking"].(bool); !ok || !v {
+		t.Error("expected qwen:enable_thinking to be true")
+	}
+	if v, ok := opts.Metadata["ollama:think"].(bool); !ok || !v {
+		t.Error("expected ollama:think to be true")
+	}
+	if m, ok := opts.Metadata["deepseek:enable_thinking"].(map[string]any); !ok || m["type"] != "enabled" {
+		t.Error("expected deepseek:enable_thinking type=enabled")
+	}
+
+	// Disabled: qwen/ollama flags false (false must survive to disable
+	// thinking on Ollama models that think by default), deepseek type disabled
+	opts2 := &llms.CallOptions{}
+	WithEnableThinking(false)(opts2)
+	if v, ok := opts2.Metadata["qwen:enable_thinking"].(bool); !ok || v {
+		t.Error("expected qwen:enable_thinking to be false")
+	}
+	if v, ok := opts2.Metadata["ollama:think"].(bool); !ok || v {
+		t.Error("expected ollama:think to be false")
+	}
+	if m, ok := opts2.Metadata["deepseek:enable_thinking"].(map[string]any); !ok || m["type"] != "disabled" {
+		t.Error("expected deepseek:enable_thinking type=disabled")
+	}
+}
+
 func TestOptionsCompatibility(t *testing.T) {
 	opts := &llms.CallOptions{}
 

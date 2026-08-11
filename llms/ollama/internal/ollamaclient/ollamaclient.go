@@ -136,6 +136,12 @@ func (c *Client) stream(ctx context.Context, method, path string, data any, fn f
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/x-ndjson")
 
+	// 调试：OLLAMA_DEBUG_STREAM=1 时打印请求体与原始 NDJSON 流，排查 think/工具调用问题用。
+	dumpStream := os.Getenv("OLLAMA_DEBUG_STREAM") != ""
+	if dumpStream && buf != nil {
+		fmt.Printf("[OLLAMA][req] %s %s body=%s\n", method, requestURL.String(), buf.String())
+	}
+
 	response, err := c.httpClient.Do(request)
 	if err != nil {
 		return err
@@ -152,6 +158,9 @@ func (c *Client) stream(ctx context.Context, method, path string, data any, fn f
 		}
 
 		bts := scanner.Bytes()
+		if dumpStream {
+			fmt.Printf("[OLLAMA][stream] %s\n", string(bts))
+		}
 		if err := json.Unmarshal(bts, &errorResponse); err != nil {
 			return err
 		}

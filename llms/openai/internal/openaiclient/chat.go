@@ -95,7 +95,15 @@ type ChatRequest struct {
 
 	// EnableThinking enables Qwen's deep thinking mode via OpenAI-compatible API.
 	// Must be used with streaming (Qwen requires enable_thinking=false for non-streaming calls).
-	EnableThinking *bool `json:"enable_thinking,omitempty"`
+	EnableThinking     *bool          `json:"enable_thinking,omitempty"`
+	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"` //vllm 控制qwen的思考方式 "chat_template_kwargs":{"enable_thinking": true},
+
+	// OllamaThink controls thinking mode when the endpoint is an Ollama server
+	// served through its OpenAI-compatible API (/v1/chat/completions). Ollama
+	// accepts a top-level "think" boolean: false disables thinking for models
+	// that think by default (e.g. qwen3), true forces it on. It is a *bool so
+	// that false is serialized explicitly and unset stays omitted.
+	OllamaThink *bool `json:"think,omitempty"`
 
 	// EnableDeepSeekThinking enables Qwen's deep thinking mode via OpenAI-compatible API.
 	// Must be used with streaming (Qwen requires enable_thinking=false for non-streaming calls).
@@ -104,6 +112,8 @@ type ChatRequest struct {
 	// ThinkingBudget limits the thinking tokens for Qwen models.
 	// Supported by Qwen3+ models.
 	ThinkingBudget int `json:"thinking_budget,omitempty"`
+
+	ThinkingBudgetToken int `json:"thinking_token_budget,omitempty"`
 }
 
 // MarshalJSON ensures that only one of MaxTokens or MaxCompletionTokens is sent.
@@ -476,6 +486,9 @@ type StreamedChatResponsePayload struct {
 			ToolCalls []*ToolCall `json:"tool_calls,omitempty"`
 			// This field is only used with the deepseek-reasoner model and represents the reasoning contents of the assistant message before the final answer.
 			ReasoningContent string `json:"reasoning_content,omitempty"`
+			// Reasoning 是 Ollama 的 OpenAI 兼容端点(/v1/chat/completions)发送思考内容所用的字段名；
+			// 标准 OpenAI / DeepSeek 使用上面的 reasoning_content。合并逻辑见 combineStreamingChatResponse。
+			Reasoning string `json:"reasoning,omitempty"`
 		} `json:"delta,omitempty"`
 		FinishReason FinishReason `json:"finish_reason,omitempty"`
 	} `json:"choices,omitempty"`
@@ -555,6 +568,8 @@ func (c *Client) createChat(ctx context.Context, payload *ChatRequest) (*ChatCom
 
 	// Build request
 	body := bytes.NewReader(payloadBytes)
+	//println("bobbbdddddddddddddddddddddddddddsdjfsldkjflsjdflkdjflsdjflsdjflsdjflsdjflsdjflsdf")
+	//println(string(payloadBytes))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.buildURL("/chat/completions", payload.Model), body)
 	if err != nil {
 		return nil, err
@@ -629,6 +644,7 @@ func parseStreamingChatResponse(ctx context.Context, r *http.Response, payload *
 
 			data := strings.TrimPrefix(line, "data:") // here use `data:` instead of `data: ` for compatibility
 			data = strings.TrimSpace(data)
+			//fmt.Printf("[LLMSTREAM][raw] %s\n", data) // DEBUG: 供应商发来的原始 SSE data
 			if data == "[DONE]" {
 				return
 			}
@@ -693,10 +709,16 @@ func combineStreamingChatResponse(
 		}
 		choice := streamResponse.Choices[0]
 		chunk := []byte(choice.Delta.Content)
-		reasoningChunk := []byte(choice.Delta.ReasoningContent) // TODO: not sure if there will be any reasoning related to function call later, so just pass it here
+		// 合并思考字段：标准 OpenAI/DeepSeek 用 reasoning_content，Ollama 的 OpenAI 兼容端点用 reasoning。
+		// 同一供应商不会两者并发；若同时出现则以标准的 reasoning_content 为准。
+		reasoning := choice.Delta.ReasoningContent
+		if reasoning == "" {
+			reasoning = choice.Delta.Reasoning
+		}
+		reasoningChunk := []byte(reasoning) // TODO: not sure if there will be any reasoning related to function call later, so just pass it here
 		response.Choices[0].Message.Content += choice.Delta.Content
 		response.Choices[0].FinishReason = choice.FinishReason
-		response.Choices[0].Message.ReasoningContent += choice.Delta.ReasoningContent
+		response.Choices[0].Message.ReasoningContent += reasoning
 
 		if choice.Delta.FunctionCall != nil {
 			chunk = updateFunctionCall(response.Choices[0].Message, choice.Delta.FunctionCall)
@@ -717,6 +739,20 @@ func combineStreamingChatResponse(
 				})
 			}
 		}
+
+		// DEBUG: 打印底层从单个 SSE chunk 解析出的 内容/思考/工具调用（对照 Ollama vs DeepSeek）
+		//fmt.Printf("[LLMSTREAM][parsed] finish=%q content=%q reasoning_content=%q reasoning=%q merged=%q delta.tool_calls=%d\n",
+		//	choice.FinishReason, choice.Delta.Content, choice.Delta.ReasoningContent, choice.Delta.Reasoning, reasoning, len(choice.Delta.ToolCalls))
+		//for i, tc := range choice.Delta.ToolCalls {
+		//	fmt.Printf("[LLMSTREAM][parsed]   delta.tool_calls[%d] index=%d id=%q type=%q fn.name=%q fn.args=%q\n",
+		//		i, tc.Index, tc.ID, string(tc.Type), tc.Function.Name, tc.Function.Arguments)
+		//}
+		//fmt.Printf("[LLMSTREAM][toCallback] content=%q reasoning=%q toolCalls=%d\n",
+		//	string(chunk), string(reasoningChunk), len(toolCalls))
+		//for i, tc := range toolCalls {
+		//	fmt.Printf("[LLMSTREAM][toCallback]   toolCalls[%d] id=%q type=%q fn.name=%q fn.args=%q\n",
+		//		i, tc.ID, tc.Type, tc.FunctionCall.Name, tc.FunctionCall.Arguments)
+		//}
 
 		if payload.StreamingFunc != nil {
 			err := payload.StreamingFunc(ctx, chunk)

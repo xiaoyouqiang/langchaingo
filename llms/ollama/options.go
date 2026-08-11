@@ -22,6 +22,9 @@ type options struct {
 	keepAlive           string
 	pullModel           bool
 	pullTimeout         time.Duration
+	// think 是提供商级默认思考开关（WithThink 设置）。请求若带 thinking_config
+	// （llms.WithThinkingMode）则以其为准，否则回落到这个默认值。
+	think *bool
 }
 
 type Option func(*options)
@@ -281,9 +284,12 @@ func WithPredictPenalizeNewline(val bool) Option {
 
 // WithThink enables reasoning mode for models that support it (Ollama 0.9.0+).
 // When enabled, the model will show its internal reasoning process.
+// 这是提供商级默认值；单次请求用 llms.WithThinkingMode 可覆盖。
+// 传 false 会显式下发 think:false（关闭思考，Qwen3 等默认开启思考的模型需要）。
 func WithThink(val bool) Option {
 	return func(opts *options) {
-		opts.ollamaOptions.Think = val
+		v := val
+		opts.think = &v
 	}
 }
 

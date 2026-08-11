@@ -2,6 +2,7 @@ package ollama
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -115,13 +116,29 @@ func (o *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 	// text + potential images.
 	chatMsgs := make([]*ollamaclient.Message, 0, len(messages))
 	for _, mc := range messages {
+		// 工具结果消息：role="tool"，每个 ToolCallResponse 生成一条独立消息，
+		// 携带 tool_call_id 以关联对应的 assistant tool_calls。
+		if mc.Role == llms.ChatMessageTypeTool {
+			for _, p := range mc.Parts {
+				if tcr, ok := p.(llms.ToolCallResponse); ok {
+					chatMsgs = append(chatMsgs, &ollamaclient.Message{
+						Role:       "tool",
+						Content:    tcr.Content,
+						ToolCallID: tcr.ToolCallID,
+					})
+				}
+			}
+			continue
+		}
+
 		msg := &ollamaclient.Message{Role: typeToRole(mc.Role)}
 
 		// Look at all the parts in mc; expect to find a single Text part and
-		// any number of binary parts.
+		// any number of binary parts. Assistant 消息还可能携带 ToolCall parts。
 		var text string
 		foundText := false
 		var images []ollamaclient.ImageData
+		var toolCalls []ollamaclient.ToolCall
 
 		for _, p := range mc.Parts {
 			switch pt := p.(type) {
@@ -133,13 +150,29 @@ func (o *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 				text = pt.Text
 			case llms.BinaryContent:
 				images = append(images, ollamaclient.ImageData(pt.Data))
+			case llms.ToolCall:
+				// assistant 消息里模型发起的工具调用。Ollama 要参数对象，
+				// 而 llms.FunctionCall.Arguments 是 JSON 字符串，这里反序列化成 map。
+				tc := ollamaclient.ToolCall{}
+				if pt.FunctionCall != nil {
+					tc.Function.Name = pt.FunctionCall.Name
+					if pt.FunctionCall.Arguments != "" {
+						args := map[string]any{}
+						if err := json.Unmarshal([]byte(pt.FunctionCall.Arguments), &args); err != nil {
+							return nil, fmt.Errorf("ollama: invalid tool call arguments for %q: %w", pt.FunctionCall.Name, err)
+						}
+						tc.Function.Arguments = args
+					}
+				}
+				toolCalls = append(toolCalls, tc)
 			default:
-				return nil, errors.New("only support Text and BinaryContent parts right now")
+				return nil, errors.New("only support Text, BinaryContent and ToolCall parts right now")
 			}
 		}
 
 		msg.Content = text
 		msg.Images = images
+		msg.ToolCalls = toolCalls
 		chatMsgs = append(chatMsgs, msg)
 	}
 
@@ -148,24 +181,40 @@ func (o *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 		format = "json"
 	}
 
-	// Get our ollamaOptions from llms.CallOptions
+	// Get our ollamaOptions from llms.CallOptions（数值类参数；think 开关单独走顶层）
 	ollamaOptions := makeOllamaOptionsFromOptions(o.options.ollamaOptions, opts)
 
-	// Handle thinking mode if specified via metadata
-	if opts.Metadata != nil {
-		if config, ok := opts.Metadata["thinking_config"].(*llms.ThinkingConfig); ok {
-			if config.Mode != llms.ThinkingModeNone && o.SupportsReasoning() {
-				// Enable thinking for models that support it
-				ollamaOptions.Think = true
-			}
+	// Convert llms tools to ollama /api/chat tool definitions (OpenAI 兼容形态)。
+	var ollamaTools []ollamaclient.Tool
+	for _, t := range opts.Tools {
+		if t.Function == nil {
+			continue
 		}
+		ollamaTools = append(ollamaTools, ollamaclient.Tool{
+			Type: "function",
+			Function: ollamaclient.ToolFunction{
+				Name:        t.Function.Name,
+				Description: t.Function.Description,
+				Parameters:  t.Function.Parameters,
+			},
+		})
 	}
+
 	req := &ollamaclient.ChatRequest{
 		Model:    model,
 		Format:   format,
 		Messages: chatMsgs,
 		Options:  ollamaOptions,
-		Stream:   opts.StreamingFunc != nil,
+		// 任一流式回调存在即开启流式（content-only 或 reasoning+toolcall）。
+		Stream: opts.StreamingFunc != nil || opts.StreamingReasoningFuncAndToolCall != nil,
+		Tools:  ollamaTools,
+		// think 必须在请求顶层（ollama 忽略 options.think）。
+		// 优先用单次请求的 thinking_config（ThinkingModeNone → 显式 false），
+		// 没有则回落到提供商级默认 WithThink。
+		Think: thinkFlagFromOptions(opts),
+	}
+	if req.Think == nil {
+		req.Think = o.options.think
 	}
 
 	keepAlive := o.options.keepAlive
@@ -175,22 +224,54 @@ func (o *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 
 	var fn ollamaclient.ChatResponseFunc
 	streamedResponse := ""
+	streamedThinking := ""
 	var resp ollamaclient.ChatResponse
+	var respToolCalls []ollamaclient.ToolCall
 
 	fn = func(response ollamaclient.ChatResponse) error {
-		if opts.StreamingFunc != nil && response.Message != nil {
-			if err := opts.StreamingFunc(ctx, []byte(response.Message.Content)); err != nil {
-				return err
-			}
-		}
 		if response.Message != nil {
-			streamedResponse += response.Message.Content
+			reasoningChunk := response.Message.Thinking
+			contentChunk := response.Message.Content
+
+			// 优先走 reasoning+toolcall 回调（能把思考内容透传给上层）；
+			// 未设置时回落到 content-only 的 StreamingFunc。
+			if opts.StreamingReasoningFuncAndToolCall != nil {
+				var chunkToolCalls []llms.ToolCall
+				for i, tc := range response.Message.ToolCalls {
+					argsBytes, _ := json.Marshal(tc.Function.Arguments)
+					chunkToolCalls = append(chunkToolCalls, llms.ToolCall{
+						ID:   fmt.Sprintf("call_%d", i),
+						Type: "function",
+						FunctionCall: &llms.FunctionCall{
+							Name:      tc.Function.Name,
+							Arguments: string(argsBytes),
+						},
+					})
+				}
+				if err := opts.StreamingReasoningFuncAndToolCall(ctx, []byte(reasoningChunk), []byte(contentChunk), chunkToolCalls); err != nil {
+					return err
+				}
+			} else if opts.StreamingFunc != nil {
+				if err := opts.StreamingFunc(ctx, []byte(contentChunk)); err != nil {
+					return err
+				}
+			}
+
+			streamedResponse += contentChunk
+			streamedThinking += reasoningChunk
+			// 累积模型发起的工具调用。工具调用场景下 Ollama 通常在最终的
+			// done 消息里一次性返回 tool_calls；流式场景逐条累积以兼容。
+			if len(response.Message.ToolCalls) > 0 {
+				respToolCalls = append(respToolCalls, response.Message.ToolCalls...)
+			}
 		}
 		if !req.Stream || response.Done {
 			resp = response
 			resp.Message = &ollamaclient.Message{
-				Role:    "assistant",
-				Content: streamedResponse,
+				Role:      "assistant",
+				Content:   streamedResponse,
+				Thinking:  streamedThinking,
+				ToolCalls: respToolCalls,
 			}
 		}
 		return nil
@@ -206,8 +287,10 @@ func (o *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 
 	// Handle case where Message might be nil (e.g., context cancelled during streaming)
 	content := ""
+	thinking := ""
 	if resp.Message != nil {
 		content = resp.Message.Content
+		thinking = resp.Message.Thinking
 	}
 
 	// Build generation info with standardized fields
@@ -215,9 +298,9 @@ func (o *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 		"CompletionTokens": resp.EvalCount,
 		"PromptTokens":     resp.PromptEvalCount,
 		"TotalTokens":      resp.EvalCount + resp.PromptEvalCount,
-		// Add empty thinking fields for cross-provider compatibility
-		"ThinkingContent": "", // Ollama doesn't separate thinking content
-		"ThinkingTokens":  0,  // Ollama doesn't track thinking tokens separately
+		// 思考内容（think 开启时）；与 openai provider 的 ThinkingContent 字段对齐。
+		"ThinkingContent": thinking,
+		"ThinkingTokens":  0, // Ollama 不单独统计思考 token
 	}
 
 	// If context caching is enabled, track cache usage
@@ -236,15 +319,45 @@ func (o *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 
 	// Note: Ollama may include thinking in the main content when Think mode is enabled
 	// Future versions may provide separate thinking content
-	if ollamaOptions.Think && o.SupportsReasoning() {
+	if req.Think != nil && *req.Think {
 		genInfo["ThinkingEnabled"] = true
+	}
+
+	// Convert ollama tool calls to langchaingo tool calls.
+	// Ollama 原生不返回 tool_call id，这里合成稳定 id（call_0、call_1…），
+	// 让上层能用同一 id 关联 assistant tool_calls 与随后的 tool 结果消息。
+	// Ollama 的 arguments 是对象，langchaingo 要 JSON 字符串，故重新序列化。
+	var choiceToolCalls []llms.ToolCall
+	for i, tc := range respToolCalls {
+		argsBytes, err := json.Marshal(tc.Function.Arguments)
+		if err != nil {
+			argsBytes = []byte("{}")
+		}
+		choiceToolCalls = append(choiceToolCalls, llms.ToolCall{
+			ID:   fmt.Sprintf("call_%d", i),
+			Type: "function",
+			FunctionCall: &llms.FunctionCall{
+				Name:      tc.Function.Name,
+				Arguments: string(argsBytes),
+			},
+		})
 	}
 
 	choices := []*llms.ContentChoice{
 		{
 			Content:        content,
 			GenerationInfo: genInfo,
+			ToolCalls:      choiceToolCalls,
+			// 思考内容（think 开启时）；ReasoningContent 是跨提供商的标准字段。
+			ReasoningContent: thinking,
+			// 停止原因："stop" 自然结束 / "length" 命中 num_predict 被截断
+			// （思考吃光预算时会出现 length + 正文为空/截断）。
+			StopReason: resp.DoneReason,
 		},
+	}
+	// FuncCall 保留首个工具调用，向后兼容只读 FuncCall 的调用方。
+	if len(choiceToolCalls) > 0 {
+		choices[0].FuncCall = choiceToolCalls[0].FunctionCall
 	}
 
 	response := &llms.ContentResponse{Choices: choices}
@@ -324,17 +437,25 @@ func makeOllamaOptionsFromOptions(ollamaOptions ollamaclient.Options, opts llms.
 	ollamaOptions.FrequencyPenalty = float32(opts.FrequencyPenalty)
 	ollamaOptions.PresencePenalty = float32(opts.PresencePenalty)
 
-	// Extract thinking configuration for models that support it
-	if opts.Metadata != nil {
-		if config, ok := opts.Metadata["thinking_config"].(*llms.ThinkingConfig); ok {
-			// Enable thinking mode if not explicitly disabled
-			if config.Mode != llms.ThinkingModeNone {
-				ollamaOptions.Think = true
-			}
-		}
-	}
+	// 注意：思考开关 think 是 ChatRequest 顶层字段，不在 options 里，
+	// 由 GenerateContent 单独计算并赋给 req.Think（ollama 忽略 options.think）。
 
 	return ollamaOptions
+}
+
+// thinkFlagFromOptions 根据 llms.CallOptions 里的 thinking_config 计算请求顶层的 think 开关。
+//   mode != None → &true；mode == None → &false（显式关闭，Qwen3 等默认开思考）；
+//   没有 thinking_config → nil（不下发，用模型默认）。
+func thinkFlagFromOptions(opts llms.CallOptions) *bool {
+	if opts.Metadata == nil {
+		return nil
+	}
+	config, ok := opts.Metadata["thinking_config"].(*llms.ThinkingConfig)
+	if !ok {
+		return nil
+	}
+	thinking := config.Mode != llms.ThinkingModeNone
+	return &thinking
 }
 
 // pullModelIfNeeded pulls the model if it's not already available.

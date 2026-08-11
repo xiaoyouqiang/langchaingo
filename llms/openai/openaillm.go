@@ -253,7 +253,7 @@ func (o *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 	if opts.Metadata != nil {
 		for k, v := range opts.Metadata {
 			// Skip internal metadata keys
-			if k == "thinking_config" || strings.HasPrefix(k, "openai:") || strings.HasPrefix(k, "qwen:") {
+			if k == "thinking_config" || strings.HasPrefix(k, "openai:") || strings.HasPrefix(k, "qwen:") || strings.HasPrefix(k, "ollama:") {
 				continue
 			}
 			apiMetadata[k] = v
@@ -268,9 +268,13 @@ func (o *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 	var enableThinking *bool
 	var thinkingBudget int
 	var enableDeepSeekThinking map[string]any
+	var ollamaThink *bool
 	if opts.Metadata != nil {
 		if v, ok := opts.Metadata["qwen:enable_thinking"].(bool); ok {
 			enableThinking = &v
+		}
+		if v, ok := opts.Metadata["ollama:think"].(bool); ok {
+			ollamaThink = &v
 		}
 		if v, ok := opts.Metadata["deepseek:enable_thinking"].(map[string]any); ok {
 			enableDeepSeekThinking = v
@@ -315,8 +319,11 @@ func (o *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 		Seed:                 opts.Seed,
 		Metadata:             apiMetadata,
 		EnableThinking:       enableThinking,
+		ChatTemplateKwargs:   map[string]any{"enable_thinking": enableThinking},
+		OllamaThink:          ollamaThink,
 		DeepSeekThinking:     enableDeepSeekThinking,
 		ThinkingBudget:       thinkingBudget,
+		ThinkingBudgetToken:  thinkingBudget,
 		WebSearchOptions:     webSearchOptionsFromCallOptions(opts.WebSearchOptions),
 	}
 	if opts.JSONMode {
