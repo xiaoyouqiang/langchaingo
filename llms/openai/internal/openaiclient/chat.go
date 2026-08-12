@@ -568,8 +568,8 @@ func (c *Client) createChat(ctx context.Context, payload *ChatRequest) (*ChatCom
 
 	// Build request
 	body := bytes.NewReader(payloadBytes)
-	//println("bobbbdddddddddddddddddddddddddddsdjfsldkjflsjdflkdjflsdjflsdjflsdjflsdjflsdjflsdf")
-	//println(string(payloadBytes))
+	println("大模型原始参数------------------------------------------------------------------------------------------")
+	println(string(payloadBytes))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.buildURL("/chat/completions", payload.Model), body)
 	if err != nil {
 		return nil, err
